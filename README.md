@@ -150,7 +150,19 @@ The column names (`YEAR`, `WEIGHT`, `WEIGHT_ONLINE`), the special codes, the fil
 every label printed in the documents are constants in [`src/config.py`](src/config.py), so the tool
 can be pointed at another file layout or translated without touching the tabulation code.
 
-## Getting started
+## Download
+
+**[SurveyTabulator.exe](https://github.com/ablesarodriguez/survey-tabulator/releases/latest/download/SurveyTabulator.exe)**
+(Windows 10 or 11, 64-bit, about 45 MB). A single file with nothing to install: download it and
+double-click. To try it without data of your own, also download
+[`sample_survey.sav`](data/sample_survey.sav) and open it from the application.
+
+The executable is not code-signed, so the first time Windows SmartScreen may show "Windows protected
+your PC"; choose *More info* and then *Run anyway*. It takes a few seconds to start because it
+unpacks itself to a temporary folder. Every version is listed under
+[Releases](https://github.com/ablesarodriguez/survey-tabulator/releases).
+
+## Running from source
 
 Requires Python 3.10 or newer.
 
@@ -166,9 +178,10 @@ Then open `data/sample_survey.sav`, move a few variables to the right and press 
 Open `data/sample_library.sav` afterwards, or any `.sav` of your own, to see the window adapt.
 See [data/README.md](data/README.md) for what the sample files contain.
 
-### Standalone executable
+### Building the executable
 
-The CEO team used the tool as a single `.exe` with nothing to install. To build it:
+The CEO team used the tool as a single `.exe` with nothing to install, and the download above is
+built the same way. Building it in a fresh virtual environment keeps unrelated packages out of it:
 
 ```bash
 pip install pyinstaller
