@@ -267,8 +267,10 @@ class App:
         for position, role in enumerate(('year', 'weight', 'online_weight')):
             ttk.Label(frame_columns, text=self.tr('column_' + role), font=('Segoe UI', 9, 'bold')).grid(
                 row=0, column=2 * position, sticky='w', padx=(8, 4), pady=6)
-            box = ttk.Combobox(frame_columns, state='readonly', width=20)
-            box.grid(row=0, column=2 * position + 1, sticky='w', padx=(0, 12))
+            # The three boxes share whatever width the labels leave, in any language
+            box = ttk.Combobox(frame_columns, state='readonly', width=8)
+            box.grid(row=0, column=2 * position + 1, sticky='ew', padx=(0, 12))
+            frame_columns.columnconfigure(2 * position + 1, weight=1, uniform='columns')
             box.bind('<<ComboboxSelected>>', lambda event, role=role: self._on_column_change(role))
             self.column_boxes[role] = box
         self._show_columns()
