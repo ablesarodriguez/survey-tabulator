@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# PyInstaller output
+build/
+dist/
+
+# Survey data stays out of the repository; only the synthetic sample is tracked
+*.sav
+!data/sample_survey.sav
+
+# Generated tables
+*.xlsx
+*.pdf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

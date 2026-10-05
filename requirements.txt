@@ -1,0 +1,5 @@
+pandas
+pyreadstat
+XlsxWriter
+reportlab
+ttkbootstrap

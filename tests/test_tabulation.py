@@ -1,0 +1,155 @@
+"""Checks of the tabulation against tables worked out by hand.
+
+    python -m unittest discover tests
+"""
+
+import os
+import sys
+import tempfile
+import unittest
+
+import pandas as pd
+import pyreadstat
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
+
+from excel_export import write_excel
+from make_sample_data import build
+from pdf_export import write_pdf
+from tabulation import accumulate, build_variable_rows, compute_scale_statistics
+
+# Eight interviews in two waves. Interviews 4 and 8 were done by telephone.
+ROWS = pd.DataFrame({
+    'YEAR':          [2024, 2024, 2024, 2024, 2025, 2025, 2025, 2025],
+    'WEIGHT':        [1.5,  0.5,  1.0,  1.0,  2.0,  1.0,  0.5,  0.5],
+    'WEIGHT_ONLINE': [1.0,  1.0,  1.0,  0.0,  1.5,  1.0,  0.5,  0.0],
+    'ANSWER':        [1,    2,    1,    9999, 2,    2,    1,    1],
+    'OWNER':         [1,    1,    2,    2,    1,    2,    2,    1],
+    'FUEL':          [1,    2,    7777, 7777, 1,    7777, 7777, 2],
+    'DEVICE':        [1,    2,    1,    4444, 2,    2,    1,    4444],
+    'SCORE':         [0,    2,    4,    6,    8,    10,   10,   8888],
+}).astype('float64')
+
+VALUE_LABELS = {
+    'ANSWER': {1.0: 'Yes', 2.0: 'No', 9999.0: 'No answer'},
+    'OWNER': {1.0: 'Yes', 2.0: 'No'},
+    'FUEL': {1.0: 'Petrol', 2.0: 'Diesel', 7777.0: 'Not asked (filter)'},
+    'DEVICE': {1.0: 'Phone', 2.0: 'Computer', 4444.0: 'Not asked (telephone interview)'},
+    'SCORE': {8888.0: "Don't know"},
+}
+
+
+class TabulationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        cls.path = os.path.join(cls.tmp.name, 'tiny.sav')
+        pyreadstat.write_sav(ROWS, cls.path, variable_value_labels=VALUE_LABELS)
+        _, cls.meta = pyreadstat.read_sav(cls.path, metadataonly=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def tabulate(self, variable, excluded=(), years=(2024, 2025), chunk_size=50_000):
+        data = accumulate(self.path, self.meta, [variable], list(excluded), list(years), chunk_size=chunk_size)
+        return data, build_variable_rows(variable, data)
+
+    def test_weighted_counts_per_year(self):
+        data, (categories, rows, bases, label, filters) = self.tabulate('OWNER')
+        self.assertEqual(data['years'], [2024, 2025])
+        self.assertEqual(categories, ['Yes', 'No'])
+        self.assertEqual(rows['Yes'], ({2024: 2, 2025: 2}, 4))   # 1.5 + 0.5 | 2.0 + 0.5 (rounded half to even)
+        self.assertEqual(rows['No'], ({2024: 2, 2025: 2}, 4))    # 1.0 + 1.0 | 1.0 + 0.5
+        self.assertEqual(bases, [8, 4, 4])
+        self.assertEqual(label, 'Weighted base: Total')
+        self.assertEqual(filters, set())
+
+    def test_special_codes_go_last_and_can_be_excluded(self):
+        _, (categories, rows, _, _, filters) = self.tabulate('ANSWER')
+        self.assertEqual(categories, ['Yes', 'No', 'No answer'])
+        self.assertEqual(filters, {'No answer'})
+        self.assertEqual(rows['No answer'], ({2024: 1, 2025: 0}, 1))
+
+        _, (categories, _, _, _, _) = self.tabulate('ANSWER', excluded=[9999.0])
+        self.assertEqual(categories, ['Yes', 'No'])
+
+    def test_filtered_question_reduces_the_base(self):
+        _, (categories, rows, bases, label, filters) = self.tabulate('FUEL', excluded=[7777.0])
+        self.assertEqual(categories, ['Petrol', 'Diesel'])
+        # Each wave has 4 interviews; the routed ones weigh 2.0 in 2024 and 1.5 in 2025
+        self.assertEqual(bases, [4, 2, 2])
+        self.assertIn('Filtered question', label)
+
+    def test_online_only_question_uses_the_online_weight(self):
+        _, (categories, rows, bases, label, _) = self.tabulate('DEVICE', excluded=[4444.0])
+        self.assertEqual(categories, ['Phone', 'Computer'])
+        self.assertEqual(rows['Phone'], ({2024: 2, 2025: 0}, 2))      # 1.0 + 1.0 | 0.5
+        self.assertEqual(rows['Computer'], ({2024: 1, 2025: 2}, 4))   # 1.0 | 1.5 + 1.0
+        self.assertEqual(bases, [6, 3, 3])
+        self.assertTrue(label.startswith('Weighted base: Online'))
+
+    def test_year_filter(self):
+        data, (_, rows, bases, _, _) = self.tabulate('OWNER', years=[2025])
+        self.assertEqual(data['years'], [2025])
+        self.assertEqual(data['total_rows'], 4)
+        self.assertEqual(bases, [4, 4])
+
+    def test_result_does_not_depend_on_the_block_size(self):
+        for variable in ('ANSWER', 'FUEL', 'DEVICE', 'SCORE'):
+            _, whole = self.tabulate(variable)
+            for chunk_size in (1, 3, 5):
+                _, in_blocks = self.tabulate(variable, chunk_size=chunk_size)
+                self.assertEqual(whole, in_blocks, f"{variable}, blocks of {chunk_size}")
+
+    def test_scale_statistics(self):
+        data, (categories, rows, _, _, _) = self.tabulate('SCORE', excluded=[8888.0])
+        stats = compute_scale_statistics(categories, rows, data['years'])
+        # 2024: scores 0, 2, 4, 6 weighted 1.5, 0.5, 1, 1 -> counts 2, 0, 1, 1
+        self.assertAlmostEqual(stats['mean'][2024], (0 * 2 + 4 + 6) / 4)
+        self.assertAlmostEqual(stats['std_dev'][2024], (((2.5 ** 2) * 2 + 1.5 ** 2 + 3.5 ** 2) / 3) ** 0.5)
+
+        _, (categories, rows, _, _, _) = self.tabulate('OWNER')
+        self.assertIsNone(compute_scale_statistics(categories, rows, data['years']))
+
+
+class SampleFileTest(unittest.TestCase):
+    """End-to-end run on the synthetic survey, including both exporters."""
+
+    def test_tabulate_and_export(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'survey.sav')
+            df, column_labels, value_labels = build(3000)
+            pyreadstat.write_sav(df, path, column_labels=column_labels, variable_value_labels=value_labels)
+            _, meta = pyreadstat.read_sav(path, metadataonly=True)
+            variables = [c for c in meta.column_names if c != 'ID']
+            excluded = [8888.0, 9999.0, 7777.0, 4444.0]
+
+            whole = accumulate(path, meta, variables, excluded, [2022, 2023, 2024, 2025])
+            in_blocks = accumulate(path, meta, variables, excluded, [2022, 2023, 2024, 2025], chunk_size=400)
+            self.assertEqual(whole['total_rows'], 3000)
+
+            for variable in variables:
+                table = build_variable_rows(variable, whole)
+                self.assertEqual(table, build_variable_rows(variable, in_blocks), variable)
+
+                # With the non-substantive answers left out, every column adds up to its base
+                _, rows, bases, _, _ = table
+                if variable in ('YEAR', 'MODE', 'SEX', 'AGE_GROUP', 'DISTRICT'):
+                    self.assertAlmostEqual(sum(total for _, total in rows.values()), bases[0], delta=len(rows))
+
+            for show_total in (True, False):
+                write_excel(whole, meta, variables, os.path.join(tmp, 'out.xlsx'), show_total, show_stats=True)
+                write_pdf(whole, meta, variables, os.path.join(tmp, 'out.pdf'), show_total, show_stats=True)
+                self.assertGreater(os.path.getsize(os.path.join(tmp, 'out.xlsx')), 5000)
+                self.assertGreater(os.path.getsize(os.path.join(tmp, 'out.pdf')), 5000)
+
+            # Single-wave layout
+            one_year = accumulate(path, meta, variables, excluded, [2025])
+            write_pdf(one_year, meta, variables, os.path.join(tmp, 'single.pdf'), False, show_stats=True)
+            write_excel(one_year, meta, variables, os.path.join(tmp, 'single.xlsx'), False, show_stats=True)
+
+
+if __name__ == '__main__':
+    unittest.main()
