@@ -2,11 +2,12 @@
 
 import xlsxwriter
 
-from config import LABELS
+from i18n import output_labels
 from tabulation import build_variable_rows, compute_scale_statistics, percentage
 
 
-def write_excel(data, meta, variables, output_path, show_total, show_stats=False, on_progress=None):
+def write_excel(data, meta, variables, output_path, show_total, show_stats=False, on_progress=None, language='en'):
+    LABELS = output_labels(language)
     variable_labels = meta.column_names_to_labels
     years = data['years']
     total_rows = data['total_rows']
@@ -87,10 +88,10 @@ def write_excel(data, meta, variables, output_path, show_total, show_stats=False
     # --- One table per variable ---
     for idx, variable in enumerate(variables):
         if on_progress:
-            on_progress(idx, len(variables), f"Excel: {variable}")
+            on_progress('excel', idx + 1, len(variables), variable)
 
         title = variable_labels.get(variable) or variable
-        categories, rows, base_values, base_label, filter_categories = build_variable_rows(variable, data)
+        categories, rows, base_values, base_label, filter_categories = build_variable_rows(variable, data, LABELS)
         stats = compute_scale_statistics(categories, rows, years) if show_stats else None
         bases = base_values if show_total else base_values[1:]
 

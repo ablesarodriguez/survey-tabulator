@@ -3,28 +3,36 @@
 The file is never loaded whole. Each block is reduced to a handful of weighted
 sums per (variable, category, year) and then discarded, so memory use depends on
 the block size and on the number of distinct categories, not on the number of
-rows.
+rows. Large files are split between several processes, each of which reads and
+reduces its own blocks.
 """
 
-import gc
 import math
+import os
 import re
-from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import numpy as np
 import pandas as pd
 import pyreadstat
 
 from config import (
     DEFAULT_CHUNK_SIZE,
     FILTER_KEYWORDS,
-    LABELS,
+    MAX_WORKERS,
     ONLINE_ONLY_CODE,
     ONLINE_WEIGHT_COLUMN,
+    PARALLEL_MIN_ROWS,
     SCALE_MIN_CATEGORIES,
     SPECIAL_CODES,
     WEIGHT_COLUMN,
     YEAR_COLUMN,
 )
+from i18n import output_labels
+
+
+class Cancelled(Exception):
+    """Raised from a progress callback to stop a job that is under way."""
 
 
 def format_category(category):
@@ -42,139 +50,233 @@ def is_special_code(value):
     return isinstance(value, (int, float)) and value in SPECIAL_CODES
 
 
+def scan_years(path):
+    """The waves present in the file, from a single pass over the year column."""
+    column, _ = pyreadstat.read_sav(path, usecols=[YEAR_COLUMN])
+    years = pd.to_numeric(column[YEAR_COLUMN], errors='coerce').dropna().astype('int64').unique()
+    return sorted(int(year) for year in years)
+
+
 # ============================================================
 # STEP 1: ACCUMULATION IN BLOCKS
 # ============================================================
 
+def _weights(chunk, column):
+    # A file without weights is tabulated unweighted
+    if column not in chunk.columns:
+        return np.ones(len(chunk))
+    return pd.to_numeric(chunk[column], errors='coerce').fillna(0).to_numpy(dtype='float64')
+
+
+def tabulate_chunk(chunk, variables, is_longitudinal, selected_years):
+    """Reduce one block of rows to its weighted sums.
+
+    Returns (rows per year, online weight per year, cells), where
+    cells[variable][(value, year)] = [weighted sum, online weighted sum].
+    """
+    if is_longitudinal:
+        years = pd.to_numeric(chunk[YEAR_COLUMN], errors='coerce').fillna(0).to_numpy(dtype='int64')
+        if selected_years and selected_years != [0]:
+            keep = np.isin(years, selected_years)
+            chunk, years = chunk[keep], years[keep]
+    else:
+        years = np.zeros(len(chunk), dtype='int64')
+
+    if not len(chunk):
+        return {}, {}, {}
+
+    weight = _weights(chunk, WEIGHT_COLUMN)
+    online_weight = _weights(chunk, ONLINE_WEIGHT_COLUMN)
+
+    year_codes, year_values = pd.factorize(years, sort=True)
+    year_values = [int(year) for year in year_values]
+    n_years = len(year_values)
+
+    rows_per_year = dict(zip(year_values, np.bincount(year_codes, minlength=n_years).tolist()))
+    online_per_year = dict(zip(year_values, np.bincount(year_codes, weights=online_weight, minlength=n_years).tolist()))
+
+    cells = {}
+    for variable in variables:
+        # Every (category, year) pair becomes one integer, so that a block is
+        # reduced with three bincounts instead of a group-by per variable.
+        codes, categories = pd.factorize(chunk[variable].to_numpy())
+        valid = codes >= 0          # missing values get the code -1
+        if valid.all():
+            keys, w, wo = codes * n_years + year_codes, weight, online_weight
+        else:
+            keys, w, wo = codes[valid] * n_years + year_codes[valid], weight[valid], online_weight[valid]
+
+        size = len(categories) * n_years
+        present = np.bincount(keys, minlength=size)
+        sums = np.bincount(keys, weights=w, minlength=size)
+        online_sums = np.bincount(keys, weights=wo, minlength=size)
+
+        table = {}
+        for idx in np.flatnonzero(present).tolist():
+            value = categories[idx // n_years]
+            if isinstance(value, np.generic):
+                value = value.item()
+            table[(value, year_values[idx % n_years])] = [float(sums[idx]), float(online_sums[idx])]
+        cells[variable] = table
+
+    return rows_per_year, online_per_year, cells
+
+
+def _read_chunk(path, offset, limit, columns):
+    chunk, _ = pyreadstat.read_sav(path, row_offset=offset, row_limit=limit, usecols=columns, user_missing=True)
+    return chunk
+
+
+def _process_block(task):
+    """Entry point of the worker processes: read one block and reduce it."""
+    path, offset, limit, columns, variables, is_longitudinal, selected_years = task
+    chunk = _read_chunk(path, offset, limit, columns)
+    return tabulate_chunk(chunk, variables, is_longitudinal, selected_years)
+
+
+def default_workers(n_rows, chunk_size):
+    """How many processes are worth starting for a file of this size."""
+    if not n_rows or n_rows < PARALLEL_MIN_ROWS:
+        return 1
+    n_chunks = math.ceil(n_rows / chunk_size)
+    return max(1, min(MAX_WORKERS, (os.cpu_count() or 2) // 2, n_chunks))
+
+
 def accumulate(path, meta, variables, excluded_codes, selected_years,
-               chunk_size=DEFAULT_CHUNK_SIZE, on_progress=None):
+               chunk_size=DEFAULT_CHUNK_SIZE, on_progress=None, workers=None):
     """Read the file block by block and return the weighted sums of every table.
 
     excluded_codes are dropped from the tables altogether. selected_years limits
     a longitudinal file to those waves; it is ignored for a single-wave file.
+    workers is the number of processes; by default it depends on the file size.
+    on_progress(stage, done, total, detail) is called after every block; it can
+    raise Cancelled to stop the job.
     """
-    value_labels = {var: meta.variable_value_labels.get(var, {}) for var in variables}
-
     is_longitudinal = YEAR_COLUMN in meta.column_names
-    base_columns = [WEIGHT_COLUMN, ONLINE_WEIGHT_COLUMN]
-    if is_longitudinal:
-        base_columns.append(YEAR_COLUMN)
+    base_columns = [WEIGHT_COLUMN, ONLINE_WEIGHT_COLUMN] + ([YEAR_COLUMN] if is_longitudinal else [])
+    columns = [c for c in dict.fromkeys(list(variables) + base_columns) if c in meta.column_names]
 
-    needed_columns = list(dict.fromkeys(variables + base_columns))
-    needed_columns = [c for c in needed_columns if c in meta.column_names]
+    n_rows = getattr(meta, 'number_rows', None)
+    n_rows = n_rows if n_rows and n_rows > 0 else None
+    if workers is None:
+        workers = default_workers(n_rows, chunk_size)
 
-    rows_per_year = defaultdict(int)
-    online_weight_per_year = defaultdict(float)
-    total_rows = 0
-    years_seen = set()
+    rows_per_year, online_weight_per_year = {}, {}
+    cells = {variable: {} for variable in variables}
 
-    # sums[variable][((value, label), year)] = [weighted sum, online weighted sum]
-    sums = {var: defaultdict(lambda: [0.0, 0.0]) for var in variables}
-    online_only = {var: False for var in variables}
+    def merge(result):
+        block_rows, block_online, block_cells = result
+        for year, count in block_rows.items():
+            rows_per_year[year] = rows_per_year.get(year, 0) + count
+        for year, weight in block_online.items():
+            online_weight_per_year[year] = online_weight_per_year.get(year, 0.0) + weight
+        for variable, table in block_cells.items():
+            target = cells[variable]
+            for key, (weight, online) in table.items():
+                cell = target.get(key)
+                if cell is None:
+                    target[key] = [weight, online]
+                else:
+                    cell[0] += weight
+                    cell[1] += online
 
-    filter_codes = {
-        var: [value for value, label in value_labels[var].items() if is_filter_label(label)]
-        for var in variables
-    }
-    # Weight of the respondents routed past each question, per year
-    filtered_weight = {var: defaultdict(lambda: [0.0, 0.0]) for var in variables}
+    def report(done, total):
+        if on_progress:
+            on_progress('read', done, total, '')
 
-    excluded = []
+    def read_sequentially():
+        total = math.ceil(n_rows / chunk_size) if n_rows else None
+        offset = done = 0
+        while n_rows is None or offset < n_rows:
+            chunk = _read_chunk(path, offset, chunk_size, columns)
+            if not len(chunk):
+                break
+            merge(tabulate_chunk(chunk, variables, is_longitudinal, selected_years))
+            del chunk
+            offset += chunk_size
+            done += 1
+            report(done, total or done + 1)
+
+    def read_in_parallel():
+        tasks = [(path, offset, chunk_size, columns, list(variables), is_longitudinal, selected_years)
+                 for offset in range(0, n_rows, chunk_size)]
+        pool = ProcessPoolExecutor(max_workers=workers)
+        try:
+            futures = [pool.submit(_process_block, task) for task in tasks]
+            for done, future in enumerate(as_completed(futures), start=1):
+                merge(future.result())
+                report(done, len(tasks))
+        finally:
+            # If the job is cancelled or fails, the blocks still waiting are
+            # dropped; the workers finish the one they are on and exit, so that
+            # none of them outlives the job.
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    if workers > 1 and n_rows:
+        try:
+            read_in_parallel()
+        except Cancelled:
+            raise
+        except Exception:
+            # The workers could not start or one of them died (for instance, out
+            # of memory): start again in this process, which only holds one
+            # block at a time. A genuine error will simply show up again.
+            rows_per_year.clear()
+            online_weight_per_year.clear()
+            for table in cells.values():
+                table.clear()
+            read_sequentially()
+    else:
+        read_sequentially()
+
+    years = sorted(rows_per_year)
+    if not years:
+        raise ValueError("No valid years were found in the filtered data.")
+
+    excluded = set()
     for code in excluded_codes:
         try:
-            excluded.append(float(code))
+            excluded.add(float(code))
         except (TypeError, ValueError):
             pass
 
-    estimated_rows = getattr(meta, 'number_rows', None)
-    estimated_chunks = math.ceil(estimated_rows / chunk_size) if estimated_rows else None
+    # sums[variable][((value, label), year)] = [weighted sum, online weighted sum]
+    sums, online_only, filtered_weight = {}, {}, {}
+    for variable in variables:
+        labels = meta.variable_value_labels.get(variable, {})
+        filter_codes = {value for value, label in labels.items() if is_filter_label(label)}
+        table, routed = {}, {}
+        online_only[variable] = False
 
-    reader = pyreadstat.read_file_in_chunks(
-        pyreadstat.read_sav, path, chunksize=chunk_size,
-        usecols=needed_columns, user_missing=True
-    )
+        for (raw, year), (weight, online) in cells[variable].items():
+            label = format_category(labels.get(raw, raw))
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                value = raw
+            if value == ONLINE_ONLY_CODE:
+                online_only[variable] = True
+            if raw in filter_codes:
+                # Weight of the respondents routed past the question
+                acc = routed.setdefault(year, [0.0, 0.0])
+                acc[0] += weight
+                acc[1] += online
+            if value in excluded:
+                continue
+            table[((value, label), year)] = [weight, online]
 
-    weight_columns = [WEIGHT_COLUMN, ONLINE_WEIGHT_COLUMN]
-
-    for chunk_idx, (chunk, _) in enumerate(reader):
-        if on_progress:
-            on_progress(chunk_idx, estimated_chunks or (chunk_idx + 2), "Reading block")
-
-        if is_longitudinal:
-            chunk[YEAR_COLUMN] = pd.to_numeric(chunk[YEAR_COLUMN], errors='coerce').fillna(0).astype('int32')
-            if selected_years and selected_years != [0]:
-                chunk = chunk[chunk[YEAR_COLUMN].isin(selected_years)].copy()
-                if chunk.empty:
-                    continue
-        else:
-            chunk[YEAR_COLUMN] = 0
-
-        # A file without weights is tabulated unweighted
-        for column in weight_columns:
-            if column in chunk.columns:
-                chunk[column] = pd.to_numeric(chunk[column], errors='coerce').fillna(0).astype('float32')
-            else:
-                chunk[column] = 1.0
-
-        total_rows += len(chunk)
-        for year, count in chunk[YEAR_COLUMN].value_counts().items():
-            rows_per_year[int(year)] += int(count)
-            years_seen.add(int(year))
-        for year, weight in chunk.groupby(YEAR_COLUMN)[ONLINE_WEIGHT_COLUMN].sum().items():
-            online_weight_per_year[int(year)] += float(weight)
-
-        for var in variables:
-            series = chunk[var]
-            if not online_only[var] and series.isin([ONLINE_ONLY_CODE]).any():
-                online_only[var] = True
-
-            if filter_codes[var]:
-                mask_filter = series.isin(filter_codes[var])
-                if mask_filter.any():
-                    routed = chunk.loc[mask_filter].groupby(YEAR_COLUMN)[weight_columns].sum()
-                    for year, row in routed.iterrows():
-                        acc = filtered_weight[var][int(year)]
-                        acc[0] += float(row[WEIGHT_COLUMN])
-                        acc[1] += float(row[ONLINE_WEIGHT_COLUMN])
-
-            keep = ~pd.to_numeric(series, errors='coerce').isin(excluded)
-
-            # Group by the raw SPSS code and attach the label afterwards, so that
-            # the sort order and the special codes can rely on the numeric value.
-            grouped = (chunk.loc[keep, weight_columns]
-                       .groupby([series[keep], chunk.loc[keep, YEAR_COLUMN]], observed=True)
-                       .sum())
-
-            labels = value_labels[var]
-            acc = sums[var]
-            for (value, year), row in grouped.iterrows():
-                try:
-                    value = float(value)
-                except (TypeError, ValueError):
-                    pass
-                label = labels.get(value, value)
-                cell = acc[((value, format_category(label)), int(year))]
-                cell[0] += float(row[WEIGHT_COLUMN])
-                cell[1] += float(row[ONLINE_WEIGHT_COLUMN])
-
-            del grouped
-
-        del chunk
-        if chunk_idx % 5 == 0:
-            gc.collect()
-
-    years = sorted(years_seen)
-    if not years:
-        raise ValueError("No valid years were found in the filtered data.")
+        sums[variable] = table
+        filtered_weight[variable] = routed
 
     return {
         'years': years,
         'rows_per_year': rows_per_year,
         'online_weight_per_year': online_weight_per_year,
-        'total_rows': total_rows,
+        'total_rows': sum(rows_per_year.values()),
         'sums': sums,
         'online_only': online_only,
         'filtered_weight': filtered_weight,
+        'workers': workers,
     }
 
 
@@ -182,18 +284,20 @@ def accumulate(path, meta, variables, excluded_codes, selected_years,
 # STEP 2: ROWS OF ONE TABLE
 # ============================================================
 
-def build_variable_rows(variable, data):
+def build_variable_rows(variable, data, labels=None):
     """Turn the accumulated sums of one variable into the rows of its table.
 
     Returns (categories, rows, base_values, base_label, filter_categories), where
     rows[category] = ({year: count}, total count) and base_values is the base of
-    the total followed by the base of each year.
+    the total followed by the base of each year. labels are the output labels of
+    the chosen language.
     """
+    labels = labels or output_labels('en')
     years = data['years']
     sums = data['sums'][variable]
     is_online_only = data['online_only'][variable]
     weight_idx = 1 if is_online_only else 0
-    base_label = LABELS['weighted_base_online'] if is_online_only else LABELS['weighted_base']
+    base_label = labels['weighted_base_online'] if is_online_only else labels['weighted_base']
 
     present = {key for (key, _year) in sums.keys()}
 
@@ -244,7 +348,7 @@ def build_variable_rows(variable, data):
         for year in years
     )
     if has_filter:
-        base_label = f"{base_label}  ·  {LABELS['filtered_question']}"
+        base_label = f"{base_label}  ·  {labels['filtered_question']}"
 
     # These categories are listed with their count but without a percentage
     filter_categories = {

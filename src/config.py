@@ -1,13 +1,23 @@
-"""Data conventions and output labels.
+"""Data conventions.
 
 Everything that depends on how a particular survey file is laid out lives here,
-so the tool can be pointed at another file layout (or another language) without
-touching the tabulation code.
+so the tool can be pointed at another file layout without touching the
+tabulation code. The texts shown on screen and printed in the documents are in
+i18n.py.
 """
 
 # Rows read from the .sav file per block. Memory use grows with this value,
 # not with the size of the file.
 DEFAULT_CHUNK_SIZE = 50_000
+
+# Files with at least this many rows are split between several processes.
+# Below it, starting the processes costs more than it saves.
+PARALLEL_MIN_ROWS = 200_000
+
+# Upper limit of worker processes. Each one holds a block in memory, so this
+# also bounds the memory used; the actual number never exceeds half the logical
+# processors of the machine.
+MAX_WORKERS = 6
 
 # Column that holds the wave of each interview. A file that has it is treated
 # as longitudinal and gets one column per year; a file without it is tabulated
@@ -35,26 +45,3 @@ SPECIAL_CODES = [-8888, -7777, -3333, -1111, 1111, 2222, 3333, 4444, 5555, 6666,
 # A variable with at least this many categories numbered between 0 and 10 is
 # treated as a rating scale and gets a mean and a standard deviation.
 SCALE_MIN_CATEGORIES = 5
-
-DECIMAL_SEPARATOR = '.'
-
-LABELS = {
-    'sheet_frequencies': 'Frequencies',
-    'sheet_percentages': 'Column %',
-    'total': 'Total',
-    'year': 'Year',
-    'data': 'Data',
-    'counts': 'Counts',
-    'percentages': 'Column %',
-    'total_base': 'TOTAL base',
-    'weighted_base': 'Weighted base: Total',
-    'weighted_base_online': 'Weighted base: Online',
-    'filtered_question': 'Filtered question',
-    'mean': 'Mean',
-    'std_dev': 'Std. deviation',
-    'pdf_frequency': 'Frequency',
-    'pdf_percent': 'Percent',
-    'pdf_cumulative': 'Cumulative %',
-    'pdf_count': 'N',
-    'pdf_title': 'Statistical tables',
-}

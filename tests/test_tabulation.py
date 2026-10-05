@@ -4,9 +4,11 @@
 """
 
 import os
+import string
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import pandas as pd
 import pyreadstat
@@ -15,9 +17,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
 from excel_export import write_excel
+import i18n
+from i18n import LANGUAGES, OUTPUT, UI, output_labels
 from make_sample_data import build, build_library
 from pdf_export import write_pdf
-from tabulation import accumulate, build_variable_rows, compute_scale_statistics
+from tabulation import Cancelled, accumulate, build_variable_rows, compute_scale_statistics
 
 # Eight interviews in two waves. Interviews 4 and 8 were done by telephone.
 ROWS = pd.DataFrame({
@@ -103,6 +107,22 @@ class TabulationTest(unittest.TestCase):
                 _, in_blocks = self.tabulate(variable, chunk_size=chunk_size)
                 self.assertEqual(whole, in_blocks, f"{variable}, blocks of {chunk_size}")
 
+    def test_result_does_not_depend_on_the_number_of_processes(self):
+        for variable in ('ANSWER', 'FUEL', 'DEVICE', 'SCORE'):
+            one = accumulate(self.path, self.meta, [variable], [], [2024, 2025], chunk_size=3, workers=1)
+            two = accumulate(self.path, self.meta, [variable], [], [2024, 2025], chunk_size=3, workers=2)
+            self.assertEqual(two['workers'], 2)
+            self.assertEqual(build_variable_rows(variable, one), build_variable_rows(variable, two), variable)
+
+    def test_a_job_can_be_cancelled_from_the_progress_callback(self):
+        def stop(stage, done, total, detail):
+            raise Cancelled()
+
+        for workers in (1, 2):
+            with self.assertRaises(Cancelled):
+                accumulate(self.path, self.meta, ['ANSWER'], [], [2024, 2025], chunk_size=2,
+                           on_progress=stop, workers=workers)
+
     def test_scale_statistics(self):
         data, (categories, rows, _, _, _) = self.tabulate('SCORE', excluded=[8888.0])
         stats = compute_scale_statistics(categories, rows, data['years'])
@@ -112,6 +132,46 @@ class TabulationTest(unittest.TestCase):
 
         _, (categories, rows, _, _, _) = self.tabulate('OWNER')
         self.assertIsNone(compute_scale_statistics(categories, rows, data['years']))
+
+
+class LanguageTest(unittest.TestCase):
+    def test_every_language_has_every_text(self):
+        for texts in (UI, OUTPUT):
+            for language in LANGUAGES:
+                self.assertEqual(set(texts[language]), set(texts['en']), language)
+        for language in LANGUAGES:
+            for key, text in UI['en'].items():
+                # The same placeholders, so that a translation can never break a message
+                fields = lambda s: sorted(name for _, name, _, _ in string.Formatter().parse(s) if name)
+                self.assertEqual(fields(UI[language][key]), fields(text), f"{language}: {key}")
+
+    def test_the_choice_is_remembered(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'APPDATA': tmp}):
+            for language in LANGUAGES:
+                i18n.save_language(language)
+                self.assertEqual(i18n.load_language(), language)
+
+    def test_documents_are_written_in_the_chosen_language(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'survey.sav')
+            df, column_labels, value_labels = build(800)
+            pyreadstat.write_sav(df, path, column_labels=column_labels, variable_value_labels=value_labels)
+            _, meta = pyreadstat.read_sav(path, metadataonly=True)
+            variables = ['SEX', 'CAR_FUEL', 'SAT_WEBSITE']
+            data = accumulate(path, meta, variables, [8888.0, 9999.0, 7777.0, 4444.0], [2022, 2023, 2024, 2025])
+
+            for language, sheet, base in (('en', 'Frequencies', 'Weighted base: Total'),
+                                          ('ca', 'Freqüències', 'Base pond: Total'),
+                                          ('es', 'Frecuencias', 'Base pond: Total')):
+                excel = os.path.join(tmp, f'{language}.xlsx')
+                write_excel(data, meta, variables, excel, True, show_stats=True, language=language)
+                write_pdf(data, meta, variables, os.path.join(tmp, f'{language}.pdf'), True,
+                          show_stats=True, language=language)
+                sheets = pd.read_excel(excel, sheet_name=None, header=None)
+                self.assertIn(sheet, sheets)
+                self.assertIn(base, sheets[sheet][0].tolist())
+                _, _, _, label, _ = build_variable_rows('CAR_FUEL', data, output_labels(language))
+                self.assertIn(output_labels(language)['filtered_question'], label)
 
 
 class SampleFileTest(unittest.TestCase):

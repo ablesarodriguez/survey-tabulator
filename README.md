@@ -5,14 +5,16 @@ Excel and PDF, without ever loading the file into memory.
 
 - **Nothing is hard-coded for a particular questionnaire.** The window builds itself from the
   dictionary of whatever file is opened: its variables, its labels, its waves and its special codes.
-- **The size of the file does not matter.** The data is read in blocks, so a matrix with millions of
-  rows is tabulated in a couple of hundred megabytes of RAM.
+- **The size of the file does not matter.** The data is read in blocks and shared between several
+  processes: two million rows and 95 variables are tabulated in 15 seconds, the file is never loaded
+  whole, and the window stays responsive throughout, with a button to cancel.
+- **English, Catalan and Spanish**, for the application and for the documents it writes.
 
 ![The application in use: searching, adding and reordering variables, settings, generating, and opening a second, unrelated file](docs/images/demo.gif)
 
 *The application in use, recorded on the two synthetic files of this repository: search, add and
-drag variables into order, adjust the settings, generate the documents, then open a completely
-different file and watch the settings rebuild themselves.*
+drag variables into order, adjust the settings, generate the documents, switch the whole window to
+Catalan and Spanish, then open a completely different file and watch the settings rebuild themselves.*
 
 I wrote it in 2026 for the Centre d'Estudis d'Opinió (CEO) of the Generalitat de Catalunya, the
 public opinion institute of the Catalan government, as a replacement for Barbwin, the tabulation
@@ -74,9 +76,10 @@ waves it contains and the special codes its value labels use.
   it is listed at the bottom of the table with its count and no percentage.
 - **Mean and standard deviation** for 0-10 and 1-10 rating scales, detected from the categories.
 - **Excel, PDF or both**, with or without the overall *Total* column.
+- **Language** of the window and of the documents (see [Languages](#languages)).
 
-**3. Generate.** The work runs in a background thread, so the window stays responsive and reports
-the block being read.
+**3. Generate.** The work runs in the background, so the window stays responsive and reports the
+block being read. While it runs, the *Generate* button becomes *Cancel*.
 
 ![Tabulating 95 variables of a two-million-row file](docs/images/progress.png)
 
@@ -109,30 +112,63 @@ instead:
 The Excel workbook has two sheets with the same layout, one with the weighted counts and one with
 the column percentages, ready to be pasted into a report.
 
-## Why it does not run out of memory
+## Languages
+
+The settings tab has a language selector with English, Catalan and Spanish. It changes two things at
+once: every text of the window, which is redrawn on the spot without losing the loaded file or the
+selected variables, and every label printed in the Excel and PDF files, including the decimal
+separator. The choice is remembered for the next time the program is opened; the first time, it
+follows the language of Windows.
+
+| Settings in Catalan | Variables in Spanish |
+| :---: | :---: |
+| ![The settings tab in Catalan](docs/images/settings_ca.png) | ![The variables tab in Spanish](docs/images/variables_es.png) |
+
+![PDF generated in Catalan](docs/images/pdf_catalan.png)
+
+*The same tables as above, generated in Catalan: "Abs", "Base pond: Total", decimal comma. The
+category names stay as they are because they come from the file, not from the application.*
+
+All the texts are in [`src/i18n.py`](src/i18n.py), one dictionary per language, and a test checks
+that no language is missing a text. Adding a fourth language is adding one more dictionary.
+
+## Fast, and it does not hang
 
 A `.sav` file is compressed on disk and expands many times over when it becomes a DataFrame. Loading
 it whole is what makes a large matrix unmanageable. This tool never does that:
 
-1. Only the columns needed for the selected variables are read, 50,000 rows at a time (configurable).
-2. Each block is reduced straight away to a few weighted sums per variable, category and year, which
-   are added to running totals. Then the block is discarded.
-3. The tables are built from those totals at the end, and the Excel file is written in XlsxWriter's
-   `constant_memory` mode, row by row.
+1. **Blocks.** Only the columns needed for the selected variables are read, 50,000 rows at a time
+   (configurable). Each block is reduced straight away to a few weighted sums per variable, category
+   and year, and then discarded, so memory depends on the block size and not on the number of rows.
+2. **Vectorised reduction.** Every (category, year) pair of a block is turned into one integer and
+   the weighted sums come out of three `numpy.bincount` calls per variable, instead of a pandas
+   group-by.
+3. **Several processes.** From 200,000 rows up, the blocks are shared between worker processes (up
+   to six, never more than half the logical processors), each of which reads and reduces its own
+   blocks and sends back only the sums. If the workers cannot start, the job falls back to a single
+   process on its own.
+4. **Nothing blocks the window.** The waves of a longitudinal file are found in the background when
+   it is opened, the tabulation runs outside the interface thread, and the two only talk through a
+   queue. A job can be cancelled at any point, and closing the window stops it; no worker process is
+   left behind.
+5. **Streaming output.** The Excel file is written in XlsxWriter's `constant_memory` mode, row by
+   row.
 
-Memory therefore depends on the block size and on the number of distinct categories, not on the
-number of rows.
-
-Measured with `tools/benchmark.py` (which also needs `psutil`) on a synthetic file of 2,000,000 rows and 100 variables (141 MB
-on disk), on an AMD Ryzen 5 5600H with 16 GB of RAM and Python 3.13:
+Measured with `tools/benchmark.py` (which also needs `psutil`) on a synthetic file of 2,000,000 rows
+and 100 variables (141 MB on disk), tabulating its 95 categorical variables and writing the Excel
+file, on an AMD Ryzen 5 5600H with 16 GB of RAM and Python 3.13. Memory is the peak of all the
+processes together:
 
 | | Time | Peak memory |
 | --- | ---: | ---: |
-| Tabulate the 95 categorical variables in blocks and write the Excel file | 81 s | **215 MB** |
-| Only load the whole file into a DataFrame, tabulating nothing | 23 s | 3,289 MB |
+| Six processes (the default for a file this size) | **15 s** | 961 MB |
+| One process | 55 s | **140 MB** |
+| Only load the whole file into a DataFrame, tabulating nothing | 24 s | 3,081 MB |
 
-Reading in blocks is slower than a single pass, because each block is decoded and aggregated
-separately, but it uses about fifteen times less memory and the figure stays flat as the file grows.
+With the default settings the complete job is faster than merely loading the file, in a third of the
+memory. On a machine short of RAM, one process does the same work in 140 MB, a figure that stays
+flat however large the file is. The number of processes is the `MAX_WORKERS` constant in
+[`src/config.py`](src/config.py).
 
 ## How the tables are computed
 
@@ -146,9 +182,9 @@ separately, but it uses about fifteen times less memory and the figure stays fla
 | Category order | By the numeric code in the file, not alphabetically by label |
 | Rating scale | At least five categories numbered between 0 and 10; the standard deviation is the sample one |
 
-The column names (`YEAR`, `WEIGHT`, `WEIGHT_ONLINE`), the special codes, the filter keywords and
-every label printed in the documents are constants in [`src/config.py`](src/config.py), so the tool
-can be pointed at another file layout or translated without touching the tabulation code.
+The column names (`YEAR`, `WEIGHT`, `WEIGHT_ONLINE`), the special codes and the filter keywords are
+constants in [`src/config.py`](src/config.py), so the tool can be pointed at another file layout
+without touching the tabulation code.
 
 ## Download
 
@@ -178,6 +214,17 @@ Then open `data/sample_survey.sav`, move a few variables to the right and press 
 Open `data/sample_library.sav` afterwards, or any `.sav` of your own, to see the window adapt.
 See [data/README.md](data/README.md) for what the sample files contain.
 
+### Command line
+
+With arguments, the same tabulation runs without the window, which is handy for batch jobs:
+
+```bash
+python src/app.py --input data/sample_survey.sav --output tables --format both --language ca
+```
+
+`--variables`, `--years`, `--include-special`, `--no-total`, `--no-stats`, `--chunk-size` and
+`--workers` are also available; `--help` lists them. The executable accepts the same arguments.
+
 ### Building the executable
 
 The CEO team used the tool as a single `.exe` with nothing to install, and the download above is
@@ -202,17 +249,21 @@ python -m unittest discover tests
 
 The tests tabulate a file of eight interviews whose tables are worked out by hand (weights, bases,
 filtered and online-only questions, special codes, scale statistics), check that the result is
-identical whatever the block size, and run both exporters end to end on the synthetic survey.
+identical whatever the block size and the number of processes, that a job can be cancelled, that
+every language has every text and is used in the documents, and run both exporters end to end on
+the two synthetic surveys.
 
 ## Repository layout
 
 ```
 ├── src/
 │   ├── app.py              the window: file loading, variable lists, settings, worker thread
-│   ├── tabulation.py       block-by-block accumulation and the rows of each table
+│   ├── tabulation.py       block-by-block accumulation, worker processes, rows of each table
 │   ├── excel_export.py     Excel workbook (counts and column percentages)
 │   ├── pdf_export.py       PDF document
-│   └── config.py           column names, special codes and output labels
+│   ├── i18n.py             every text of the window and of the documents, per language
+│   ├── cli.py              command-line mode
+│   └── config.py           column names, special codes, block size and number of processes
 ├── tools/
 │   ├── make_sample_data.py synthetic survey generator
 │   └── benchmark.py        time and peak memory, in blocks against loading the whole file

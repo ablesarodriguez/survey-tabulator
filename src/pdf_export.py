@@ -12,15 +12,17 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Table, TableStyle
 
-from config import DECIMAL_SEPARATOR, LABELS
+from i18n import output_labels
 from tabulation import build_variable_rows, compute_scale_statistics, percentage
 
 
-def format_number(value, decimals=1):
-    return f"{value:.{decimals}f}".replace('.', DECIMAL_SEPARATOR)
+def write_pdf(data, meta, variables, output_path, show_total, title=None, show_stats=False, on_progress=None,
+              language='en'):
+    LABELS = output_labels(language)
 
+    def format_number(value, decimals=1):
+        return f"{value:.{decimals}f}".replace('.', LABELS['decimal_separator'])
 
-def write_pdf(data, meta, variables, output_path, show_total, title=None, show_stats=False, on_progress=None):
     variable_labels = meta.column_names_to_labels
     years = data['years']
     total_rows = data['total_rows']
@@ -105,10 +107,10 @@ def write_pdf(data, meta, variables, output_path, show_total, title=None, show_s
     # --- 2. One table per variable ---
     for idx, variable in enumerate(variables):
         if on_progress:
-            on_progress(idx, len(variables), f"PDF: building tables ({variable})")
+            on_progress('pdf', idx + 1, len(variables), variable)
 
         label = variable_labels.get(variable) or variable
-        categories, rows, base_values, base_label, filter_categories = build_variable_rows(variable, data)
+        categories, rows, base_values, base_label, filter_categories = build_variable_rows(variable, data, LABELS)
         bases = base_values if (show_total or is_single) else base_values[1:]
 
         table_rows = []
@@ -169,6 +171,6 @@ def write_pdf(data, meta, variables, output_path, show_total, title=None, show_s
         story.append(table)
 
     if on_progress:
-        on_progress(len(variables), len(variables), "Rendering PDF (writing to disk...)")
+        on_progress('pdf_render', len(variables), len(variables), '')
 
     doc.build(story)
