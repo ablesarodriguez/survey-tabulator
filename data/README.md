@@ -5,10 +5,16 @@ city that does not exist. Every answer is drawn at random by `tools/make_sample_
 no real respondents and no data from any real study. It is here so that the application can be tried
 straight after cloning, and it is the file behind every screenshot in the main README.
 
-Regenerate it, or write a larger one for benchmarking, with:
+`sample_library.sav` is a second synthetic file, deliberately unlike the first: 1,500 answers from the
+users of an invented library network, in a single wave, without weights, and with other special codes
+(-1111 "Prefers not to say", 5555 "Not applicable"). Opening one after the other shows that the
+application takes everything from the file and nothing from a fixed questionnaire.
+
+Regenerate them, or write a larger one for benchmarking, with:
 
 ```bash
 python tools/make_sample_data.py
+python tools/make_sample_data.py --library
 python tools/make_sample_data.py --rows 2000000 --extra-variables 72 --out big.sav
 ```
 

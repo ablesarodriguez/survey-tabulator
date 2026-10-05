@@ -586,6 +586,7 @@ class App:
                         found_codes[value] = label
             self._show_special_codes(found_codes)
 
+            self.progress['value'] = 0
             self.label_status.config(text="Ready")
             self._update_counters()
             self.notebook.select(self.tab_variables)

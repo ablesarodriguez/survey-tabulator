@@ -6,6 +6,7 @@ online-only questions and special codes), so that the application can be tried
 and benchmarked without any real microdata.
 
     python tools/make_sample_data.py                       # data/sample_survey.sav, 6,000 rows
+    python tools/make_sample_data.py --library             # data/sample_library.sav, a different layout
     python tools/make_sample_data.py --rows 2000000 --extra-variables 60 --out big.sav
 """
 
@@ -167,18 +168,72 @@ def build(rows, seed=7, extra_variables=0):
     return pd.DataFrame(columns), col_labels, value_labels
 
 
+def build_library(rows=1500, seed=11):
+    """A second, unrelated file: one wave, no weights and a different set of codes.
+
+    It is there to show that nothing in the application is tied to one
+    questionnaire: the same window adapts to whatever the dictionary declares.
+    """
+    rng = np.random.default_rng(seed)
+    columns, col_labels, value_labels = {}, {}, {}
+    not_applicable, refused = 5555.0, -1111.0
+
+    def add(name, label, options, p, extra=None, scale=False):
+        values = rng.choice(np.arange(len(p), dtype='float64') + (0 if scale else 1), size=rows, p=p)
+        labels = dict(options)
+        for code, text, share in (extra or []):
+            values[rng.random(rows) < share] = code
+            labels[code] = text
+        columns[name], col_labels[name], value_labels[name] = values, label, labels
+
+    def options(*texts):
+        return {float(i): text for i, text in enumerate(texts, start=1)}
+
+    columns['CARD'] = np.arange(1, rows + 1, dtype='float64')
+    col_labels['CARD'] = 'Library card number (anonymised)'
+
+    add('BRANCH', 'Branch visited most often',
+        options('Central', 'Station Road', 'Hillside', 'Mobile library'), [0.46, 0.27, 0.19, 0.08])
+    add('VISITS', 'Visits in the last three months',
+        options('None', '1 to 3', '4 to 10', 'More than 10'), [0.14, 0.41, 0.31, 0.14],
+        extra=[(refused, 'Prefers not to say', 0.03)])
+    add('MEMBER_SINCE', 'Member since',
+        options('Less than a year', '1 to 5 years', 'More than 5 years'), [0.21, 0.37, 0.42])
+    add('MAIN_USE', 'Main reason for the visit',
+        options('Borrowing books', 'Studying', 'Computers and wifi', 'Activities for children', 'Other'),
+        [0.44, 0.23, 0.14, 0.13, 0.06], extra=[(refused, 'Prefers not to say', 0.02)])
+    add('EBOOKS', 'Uses the e-book lending platform', options('Yes', 'No'), [0.31, 0.69])
+    for name, label, mean in (('RATE_STAFF', 'Rating of the staff', 8.1),
+                              ('RATE_CATALOGUE', 'Rating of the catalogue', 6.7),
+                              ('RATE_HOURS', 'Rating of the opening hours', 5.9)):
+        weights = np.exp(-0.5 * ((np.arange(11) - mean) / 1.9) ** 2)
+        labels = {float(i): str(i) for i in range(11)}
+        labels[0.0], labels[10.0] = '0 Very poor', '10 Excellent'
+        add(name, label + ' (0 to 10)', labels, weights / weights.sum(), scale=True,
+            extra=[(not_applicable, 'Not applicable', 0.06), (refused, 'Prefers not to say', 0.02)])
+
+    return pd.DataFrame(columns), col_labels, value_labels
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--library', action='store_true',
+                        help='write the second sample instead: a single-wave, unweighted library survey')
     parser.add_argument('--rows', type=int, default=6000)
     parser.add_argument('--extra-variables', type=int, default=0, help='additional agreement items, to widen the file')
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--out', default=os.path.join(os.path.dirname(__file__), '..', 'data', 'sample_survey.sav'))
     args = parser.parse_args()
 
-    df, col_labels, value_labels = build(args.rows, args.seed, args.extra_variables)
+    if args.library:
+        df, col_labels, value_labels = build_library()
+        if args.out == parser.get_default('out'):
+            args.out = os.path.join(os.path.dirname(args.out), 'sample_library.sav')
+    else:
+        df, col_labels, value_labels = build(args.rows, args.seed, args.extra_variables)
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    pyreadstat.write_sav(df, out, file_label='Synthetic city services survey',
+    pyreadstat.write_sav(df, out, file_label='Synthetic survey',
                          column_labels=col_labels, variable_value_labels=value_labels, compress=True)
     print(f"{out}: {len(df):,} rows, {df.shape[1]} variables, {os.path.getsize(out) / 1e6:.1f} MB")
 

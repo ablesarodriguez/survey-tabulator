@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tools'))
 
 from excel_export import write_excel
-from make_sample_data import build
+from make_sample_data import build, build_library
 from pdf_export import write_pdf
 from tabulation import accumulate, build_variable_rows, compute_scale_statistics
 
@@ -149,6 +149,31 @@ class SampleFileTest(unittest.TestCase):
             one_year = accumulate(path, meta, variables, excluded, [2025])
             write_pdf(one_year, meta, variables, os.path.join(tmp, 'single.pdf'), False, show_stats=True)
             write_excel(one_year, meta, variables, os.path.join(tmp, 'single.xlsx'), False, show_stats=True)
+
+    def test_file_without_waves_or_weights(self):
+        """A file with none of the expected columns is tabulated as one unweighted block."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'library.sav')
+            df, column_labels, value_labels = build_library()
+            pyreadstat.write_sav(df, path, column_labels=column_labels, variable_value_labels=value_labels)
+            _, meta = pyreadstat.read_sav(path, metadataonly=True)
+            variables = [c for c in meta.column_names if c != 'CARD']
+
+            data = accumulate(path, meta, variables, [5555.0, -1111.0], [0], chunk_size=200)
+            self.assertEqual(data['years'], [0])
+            self.assertEqual(data['total_rows'], len(df))
+
+            categories, rows, bases, _, _ = build_variable_rows('BRANCH', data)
+            self.assertEqual(categories, ['Central', 'Station Road', 'Hillside', 'Mobile library'])
+            for category, code in zip(categories, (1, 2, 3, 4)):
+                self.assertEqual(rows[category][1], int((df['BRANCH'] == code).sum()))
+            self.assertEqual(bases, [len(df), len(df)])
+
+            categories, rows, _, _, _ = build_variable_rows('RATE_STAFF', data)
+            self.assertIsNotNone(compute_scale_statistics(categories, rows, data['years']))
+
+            write_excel(data, meta, variables, os.path.join(tmp, 'out.xlsx'), False, show_stats=True)
+            write_pdf(data, meta, variables, os.path.join(tmp, 'out.pdf'), False, show_stats=True)
 
 
 if __name__ == '__main__':

@@ -8,9 +8,10 @@ venv/
 build/
 dist/
 
-# Survey data stays out of the repository; only the synthetic sample is tracked
+# Survey data stays out of the repository; only the synthetic samples are tracked
 *.sav
 !data/sample_survey.sav
+!data/sample_library.sav
 
 # Generated tables
 *.xlsx
