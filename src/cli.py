@@ -13,7 +13,7 @@ from config import DEFAULT_CHUNK_SIZE, SPECIAL_CODES
 from excel_export import write_excel
 from i18n import DEFAULT_LANGUAGE, LANGUAGES
 from pdf_export import write_pdf
-from tabulation import accumulate
+from tabulation import accumulate, default_columns
 
 
 def main(argv=None):
@@ -28,6 +28,9 @@ def main(argv=None):
                         help='keep the special codes (don\'t know, no answer...) in the tables')
     parser.add_argument('--no-total', action='store_true', help='leave out the overall Total column')
     parser.add_argument('--no-stats', action='store_true', help='no mean and standard deviation for rating scales')
+    parser.add_argument('--year-column', help='column that holds the wave (default: the one in config.py, if present)')
+    parser.add_argument('--weight-column', help='weighting coefficient')
+    parser.add_argument('--online-weight-column', help='weighting coefficient of the online interviews')
     parser.add_argument('--chunk-size', type=int, default=DEFAULT_CHUNK_SIZE)
     parser.add_argument('--workers', type=int, help='number of processes (default: depends on the file size)')
     args = parser.parse_args(argv)
@@ -41,6 +44,8 @@ def main(argv=None):
     else:
         variables = [name for name in meta.column_names if name in meta.variable_value_labels]
 
+    columns = default_columns(meta.column_names, {
+        'year': args.year_column, 'weight': args.weight_column, 'online_weight': args.online_weight_column})
     years = [int(year) for year in args.years.split(',')] if args.years else []
     excluded = [] if args.include_special else SPECIAL_CODES
 
@@ -48,7 +53,7 @@ def main(argv=None):
         print(f"\r{stage}: {done}/{total}   ", end='', flush=True)
 
     data = accumulate(args.input, meta, variables, excluded, years, chunk_size=args.chunk_size,
-                      on_progress=on_progress, workers=args.workers)
+                      on_progress=on_progress, workers=args.workers, columns=columns)
 
     base, _ = os.path.splitext(args.output)
     options = dict(show_stats=not args.no_stats, on_progress=on_progress, language=args.language)

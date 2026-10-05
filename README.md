@@ -35,8 +35,8 @@ and everything on screen and in the documents is derived from it when the file i
 | Variable names | The two lists and the search box |
 | Variable labels | The title of each table |
 | Value labels | The rows of each table and their order |
-| Wave column, if there is one | One column per year and the year filter; without it, a single-block layout |
-| Weight columns, if there are any | Weighted counts and bases; without them, plain counts |
+| The column chosen as year or wave, if any | One column per year and the year filter; without it, a single-block layout |
+| The columns chosen as weights, if any | Weighted counts and bases; without them, plain counts |
 | Special codes used by the value labels | The list of switches in the settings tab |
 | Categories numbered 0 to 10 | Which tables get a mean and a standard deviation |
 | Value labels that mention a filter | Which questions get a reduced base |
@@ -50,9 +50,15 @@ declares.
 | :---: | :---: |
 | ![Settings built from the longitudinal sample](docs/images/settings.png) | ![Settings built from the single-wave sample](docs/images/settings_other_file.png) |
 
-The only assumptions are a handful of conventions (the names of the wave and weight columns and the
-list of codes treated as special), and they are plain constants in
-[`src/config.py`](src/config.py), not logic.
+**The wave and weight columns can have any name.** Every institution names them differently, so the
+settings tab lists the variables of the file and lets you say which one is the year, which the
+weight and which the online weight. The choice is remembered: the next file with the same layout
+opens ready to use. If no weight column is selected, the application asks before generating
+unweighted tables, so that it never happens by accident.
+
+The only fixed conventions left are the list of codes treated as special and the default column
+names tried on first use, and they are plain constants in [`src/config.py`](src/config.py), not
+logic.
 
 ## What it does
 
@@ -76,6 +82,7 @@ waves it contains and the special codes its value labels use.
   it is listed at the bottom of the table with its count and no percentage.
 - **Mean and standard deviation** for 0-10 and 1-10 rating scales, detected from the categories.
 - **Excel, PDF or both**, with or without the overall *Total* column.
+- **Columns of the file**: which variable is the year and which are the weights.
 - **Language** of the window and of the documents (see [Languages](#languages)).
 
 **3. Generate.** The work runs in the background, so the window stays responsive and reports the
@@ -182,9 +189,8 @@ flat however large the file is. The number of processes is the `MAX_WORKERS` con
 | Category order | By the numeric code in the file, not alphabetically by label |
 | Rating scale | At least five categories numbered between 0 and 10; the standard deviation is the sample one |
 
-The column names (`YEAR`, `WEIGHT`, `WEIGHT_ONLINE`), the special codes and the filter keywords are
-constants in [`src/config.py`](src/config.py), so the tool can be pointed at another file layout
-without touching the tabulation code.
+The wave and weight columns are chosen in the settings tab. The special codes and the filter
+keywords are constants in [`src/config.py`](src/config.py).
 
 ## Download
 
@@ -222,8 +228,9 @@ With arguments, the same tabulation runs without the window, which is handy for 
 python src/app.py --input data/sample_survey.sav --output tables --format both --language ca
 ```
 
-`--variables`, `--years`, `--include-special`, `--no-total`, `--no-stats`, `--chunk-size` and
-`--workers` are also available; `--help` lists them. The executable accepts the same arguments.
+`--variables`, `--years`, `--year-column`, `--weight-column`, `--online-weight-column`,
+`--include-special`, `--no-total`, `--no-stats`, `--chunk-size` and `--workers` are also available;
+`--help` lists them. The executable accepts the same arguments.
 
 ### Building the executable
 
@@ -249,7 +256,8 @@ python -m unittest discover tests
 
 The tests tabulate a file of eight interviews whose tables are worked out by hand (weights, bases,
 filtered and online-only questions, special codes, scale statistics), check that the result is
-identical whatever the block size and the number of processes, that a job can be cancelled, that
+identical whatever the block size, the number of processes and the names of the wave and weight
+columns, that a job can be cancelled, that
 every language has every text and is used in the documents, and run both exporters end to end on
 the two synthetic surveys.
 
@@ -262,6 +270,7 @@ the two synthetic surveys.
 │   ├── excel_export.py     Excel workbook (counts and column percentages)
 │   ├── pdf_export.py       PDF document
 │   ├── i18n.py             every text of the window and of the documents, per language
+│   ├── settings.py         what is remembered between sessions (language, chosen columns)
 │   ├── cli.py              command-line mode
 │   └── config.py           column names, special codes, block size and number of processes
 ├── tools/

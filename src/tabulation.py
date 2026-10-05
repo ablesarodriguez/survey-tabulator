@@ -50,10 +50,25 @@ def is_special_code(value):
     return isinstance(value, (int, float)) and value in SPECIAL_CODES
 
 
-def scan_years(path):
+def default_columns(column_names, preferred=None):
+    """Which columns of a file hold the wave and the weights.
+
+    For each role, the first of these that exists in the file: the name in
+    preferred (what the user chose last time), then the default in config.py.
+    A role with no match is None: no waves, or no weighting.
+    """
+    defaults = {'year': YEAR_COLUMN, 'weight': WEIGHT_COLUMN, 'online_weight': ONLINE_WEIGHT_COLUMN}
+    columns = {}
+    for role, default in defaults.items():
+        candidates = [(preferred or {}).get(role), default]
+        columns[role] = next((name for name in candidates if name and name in column_names), None)
+    return columns
+
+
+def scan_years(path, year_column):
     """The waves present in the file, from a single pass over the year column."""
-    column, _ = pyreadstat.read_sav(path, usecols=[YEAR_COLUMN])
-    years = pd.to_numeric(column[YEAR_COLUMN], errors='coerce').dropna().astype('int64').unique()
+    column, _ = pyreadstat.read_sav(path, usecols=[year_column])
+    years = pd.to_numeric(column[year_column], errors='coerce').dropna().astype('int64').unique()
     return sorted(int(year) for year in years)
 
 
@@ -62,20 +77,21 @@ def scan_years(path):
 # ============================================================
 
 def _weights(chunk, column):
-    # A file without weights is tabulated unweighted
-    if column not in chunk.columns:
+    # Without a weight column, every interview counts as one
+    if column is None or column not in chunk.columns:
         return np.ones(len(chunk))
     return pd.to_numeric(chunk[column], errors='coerce').fillna(0).to_numpy(dtype='float64')
 
 
-def tabulate_chunk(chunk, variables, is_longitudinal, selected_years):
+def tabulate_chunk(chunk, variables, columns, selected_years):
     """Reduce one block of rows to its weighted sums.
 
-    Returns (rows per year, online weight per year, cells), where
-    cells[variable][(value, year)] = [weighted sum, online weighted sum].
+    columns says which column is the wave and which are the weights (see
+    default_columns). Returns (rows per year, online weight per year, cells),
+    where cells[variable][(value, year)] = [weighted sum, online weighted sum].
     """
-    if is_longitudinal:
-        years = pd.to_numeric(chunk[YEAR_COLUMN], errors='coerce').fillna(0).to_numpy(dtype='int64')
+    if columns['year']:
+        years = pd.to_numeric(chunk[columns['year']], errors='coerce').fillna(0).to_numpy(dtype='int64')
         if selected_years and selected_years != [0]:
             keep = np.isin(years, selected_years)
             chunk, years = chunk[keep], years[keep]
@@ -85,8 +101,8 @@ def tabulate_chunk(chunk, variables, is_longitudinal, selected_years):
     if not len(chunk):
         return {}, {}, {}
 
-    weight = _weights(chunk, WEIGHT_COLUMN)
-    online_weight = _weights(chunk, ONLINE_WEIGHT_COLUMN)
+    weight = _weights(chunk, columns['weight'])
+    online_weight = _weights(chunk, columns['online_weight'])
 
     year_codes, year_values = pd.factorize(years, sort=True)
     year_values = [int(year) for year in year_values]
@@ -129,9 +145,9 @@ def _read_chunk(path, offset, limit, columns):
 
 def _process_block(task):
     """Entry point of the worker processes: read one block and reduce it."""
-    path, offset, limit, columns, variables, is_longitudinal, selected_years = task
-    chunk = _read_chunk(path, offset, limit, columns)
-    return tabulate_chunk(chunk, variables, is_longitudinal, selected_years)
+    path, offset, limit, usecols, variables, columns, selected_years = task
+    chunk = _read_chunk(path, offset, limit, usecols)
+    return tabulate_chunk(chunk, variables, columns, selected_years)
 
 
 def default_workers(n_rows, chunk_size):
@@ -143,18 +159,23 @@ def default_workers(n_rows, chunk_size):
 
 
 def accumulate(path, meta, variables, excluded_codes, selected_years,
-               chunk_size=DEFAULT_CHUNK_SIZE, on_progress=None, workers=None):
+               chunk_size=DEFAULT_CHUNK_SIZE, on_progress=None, workers=None, columns=None):
     """Read the file block by block and return the weighted sums of every table.
 
     excluded_codes are dropped from the tables altogether. selected_years limits
     a longitudinal file to those waves; it is ignored for a single-wave file.
     workers is the number of processes; by default it depends on the file size.
+    columns names the wave and weight columns; by default, those of config.py.
     on_progress(stage, done, total, detail) is called after every block; it can
     raise Cancelled to stop the job.
     """
-    is_longitudinal = YEAR_COLUMN in meta.column_names
-    base_columns = [WEIGHT_COLUMN, ONLINE_WEIGHT_COLUMN] + ([YEAR_COLUMN] if is_longitudinal else [])
-    columns = [c for c in dict.fromkeys(list(variables) + base_columns) if c in meta.column_names]
+    if columns is None:
+        columns = default_columns(meta.column_names)
+    else:
+        # An explicit choice is respected as it is, including "no such column"
+        columns = {role: (columns.get(role) if columns.get(role) in meta.column_names else None)
+                   for role in ('year', 'weight', 'online_weight')}
+    usecols = [c for c in dict.fromkeys(list(variables) + list(columns.values())) if c in meta.column_names]
 
     n_rows = getattr(meta, 'number_rows', None)
     n_rows = n_rows if n_rows and n_rows > 0 else None
@@ -188,17 +209,17 @@ def accumulate(path, meta, variables, excluded_codes, selected_years,
         total = math.ceil(n_rows / chunk_size) if n_rows else None
         offset = done = 0
         while n_rows is None or offset < n_rows:
-            chunk = _read_chunk(path, offset, chunk_size, columns)
+            chunk = _read_chunk(path, offset, chunk_size, usecols)
             if not len(chunk):
                 break
-            merge(tabulate_chunk(chunk, variables, is_longitudinal, selected_years))
+            merge(tabulate_chunk(chunk, variables, columns, selected_years))
             del chunk
             offset += chunk_size
             done += 1
             report(done, total or done + 1)
 
     def read_in_parallel():
-        tasks = [(path, offset, chunk_size, columns, list(variables), is_longitudinal, selected_years)
+        tasks = [(path, offset, chunk_size, usecols, list(variables), columns, selected_years)
                  for offset in range(0, n_rows, chunk_size)]
         pool = ProcessPoolExecutor(max_workers=workers)
         try:

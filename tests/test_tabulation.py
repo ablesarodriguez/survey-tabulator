@@ -21,7 +21,8 @@ import i18n
 from i18n import LANGUAGES, OUTPUT, UI, output_labels
 from make_sample_data import build, build_library
 from pdf_export import write_pdf
-from tabulation import Cancelled, accumulate, build_variable_rows, compute_scale_statistics
+from tabulation import (Cancelled, accumulate, build_variable_rows, compute_scale_statistics, default_columns,
+                        scan_years)
 
 # Eight interviews in two waves. Interviews 4 and 8 were done by telephone.
 ROWS = pd.DataFrame({
@@ -122,6 +123,30 @@ class TabulationTest(unittest.TestCase):
             with self.assertRaises(Cancelled):
                 accumulate(self.path, self.meta, ['ANSWER'], [], [2024, 2025], chunk_size=2,
                            on_progress=stop, workers=workers)
+
+    def test_wave_and_weight_columns_can_have_any_name(self):
+        """The same file with other column names gives the same tables once they are pointed out."""
+        renamed = ROWS.rename(columns={'YEAR': 'WAVE', 'WEIGHT': 'W', 'WEIGHT_ONLINE': 'W_WEB'})
+        path = os.path.join(self.tmp.name, 'renamed.sav')
+        pyreadstat.write_sav(renamed, path, variable_value_labels=VALUE_LABELS)
+        _, meta = pyreadstat.read_sav(path, metadataonly=True)
+        columns = {'year': 'WAVE', 'weight': 'W', 'online_weight': 'W_WEB'}
+
+        self.assertEqual(default_columns(meta.column_names), {'year': None, 'weight': None, 'online_weight': None})
+        self.assertEqual(default_columns(meta.column_names, columns), columns)
+        self.assertEqual(scan_years(path, 'WAVE'), [2024, 2025])
+
+        for variable in ('OWNER', 'FUEL', 'DEVICE'):
+            data = accumulate(path, meta, [variable], [7777.0, 4444.0], [2024, 2025], columns=columns)
+            _, expected = self.tabulate(variable, excluded=[7777.0, 4444.0])
+            self.assertEqual(build_variable_rows(variable, data), expected, variable)
+
+        # Choosing "no weight" on purpose is respected even though the file has one
+        data = accumulate(self.path, self.meta, ['OWNER'], [], [2024, 2025],
+                          columns={'year': 'YEAR', 'weight': None, 'online_weight': None})
+        _, rows, _, _, _ = build_variable_rows('OWNER', data)
+        self.assertEqual(rows['Yes'], ({2024: 2, 2025: 2}, 4))
+        self.assertEqual(rows['No'], ({2024: 2, 2025: 2}, 4))
 
     def test_scale_statistics(self):
         data, (categories, rows, _, _, _) = self.tabulate('SCORE', excluded=[8888.0])

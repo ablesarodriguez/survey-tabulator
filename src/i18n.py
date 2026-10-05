@@ -5,9 +5,9 @@ and the next Excel and PDF files are written with it. Adding a language is a
 matter of adding one more entry to LANGUAGES, UI and OUTPUT.
 """
 
-import json
 import locale
-import os
+
+import settings
 
 LANGUAGES = {'en': 'English', 'ca': 'Català', 'es': 'Castellano'}
 DEFAULT_LANGUAGE = 'en'
@@ -44,11 +44,16 @@ UI = {
         'show_stats': "Compute mean and standard deviation for 0-10 and 1-10 scales",
         'language_frame': " Language ",
         'language_hint': "Language of the application and of the generated Excel and PDF files.",
+        'columns_frame': " Columns of this file ",
+        'column_year': "Year / wave:",
+        'column_weight': "Weight:",
+        'column_online_weight': "Online weight:",
+        'column_none': "(none)",
         'year_frame': " Year filter ",
         'year_hint': "Tick the years to include in the document.",
         'year_placeholder': "Load a .sav file to detect the available years...",
         'year_scanning': "Scanning the years in the file...",
-        'year_single': "Single-wave file (no '{column}' column). It will be processed as one block.",
+        'year_single': "No year column selected: the file will be processed as a single block.",
         'year_empty': "The '{column}' column has no valid data.",
         'special_frame': " Special values ",
         'special_hint': "Tick the answers (2222, 4444...) to INCLUDE explicitly in the document.\n"
@@ -71,6 +76,8 @@ UI = {
         'need_variables': "There are no selected variables to process",
         'need_chunk_size': "The block size must be a positive integer",
         'need_year': "Select at least one year.",
+        'confirm_unweighted': "No weight column is selected in the settings tab, so the tables will count "
+                              "every interview as one (unweighted).\n\nGenerate them anyway?",
         'wait_scan': "The years of the file are still being scanned. Try again in a moment.",
         'generating': "Generating...",
         'stage_read': "Reading block {done}/{total}",
@@ -110,11 +117,16 @@ UI = {
         'show_stats': "Calcula la mitjana i la desviació en escales 0-10 i 1-10",
         'language_frame': " Idioma ",
         'language_hint': "Idioma de l'aplicació i dels fitxers Excel i PDF que es generen.",
+        'columns_frame': " Columnes d'aquest fitxer ",
+        'column_year': "Any / onada:",
+        'column_weight': "Ponderació:",
+        'column_online_weight': "Ponderació en línia:",
+        'column_none': "(cap)",
         'year_frame': " Filtre d'anys ",
         'year_hint': "Marca els anys que vols incloure al document.",
         'year_placeholder': "Carrega un fitxer .sav per detectar els anys disponibles...",
         'year_scanning': "S'estan cercant els anys del fitxer...",
-        'year_single': "Fitxer d'una sola onada (sense columna '{column}'). Es processarà com un únic bloc.",
+        'year_single': "No hi ha cap columna d'any seleccionada: el fitxer es processarà com un únic bloc.",
         'year_empty': "La columna '{column}' no té dades vàlides.",
         'special_frame': " Valors especials ",
         'special_hint': "Marca les respostes (2222, 4444...) que vols INCLOURE explícitament al document.\n"
@@ -137,6 +149,9 @@ UI = {
         'need_variables': "No hi ha cap variable seleccionada per processar",
         'need_chunk_size': "La mida del bloc ha de ser un enter positiu",
         'need_year': "Selecciona almenys un any.",
+        'confirm_unweighted': "No hi ha cap columna de ponderació seleccionada a la pestanya de configuració, "
+                              "de manera que les taules comptaran cada entrevista com a una (sense ponderar)."
+                              "\n\nVols generar-les igualment?",
         'wait_scan': "Encara s'estan cercant els anys del fitxer. Torna-ho a provar d'aquí a un moment.",
         'generating': "S'està generant...",
         'stage_read': "Llegint el bloc {done}/{total}",
@@ -176,11 +191,16 @@ UI = {
         'show_stats': "Calcular la media y la desviación en escalas 0-10 y 1-10",
         'language_frame': " Idioma ",
         'language_hint': "Idioma de la aplicación y de los archivos Excel y PDF que se generan.",
+        'columns_frame': " Columnas de este archivo ",
+        'column_year': "Año / oleada:",
+        'column_weight': "Ponderación:",
+        'column_online_weight': "Ponderación en línea:",
+        'column_none': "(ninguna)",
         'year_frame': " Filtro de años ",
         'year_hint': "Marca los años que quieras incluir en el documento.",
         'year_placeholder': "Carga un archivo .sav para detectar los años disponibles...",
         'year_scanning': "Buscando los años del archivo...",
-        'year_single': "Archivo de una sola oleada (sin columna '{column}'). Se procesará como un único bloque.",
+        'year_single': "No hay ninguna columna de año seleccionada: el archivo se procesará como un único bloque.",
         'year_empty': "La columna '{column}' no tiene datos válidos.",
         'special_frame': " Valores especiales ",
         'special_hint': "Marca las respuestas (2222, 4444...) que quieras INCLUIR explícitamente en el documento.\n"
@@ -203,6 +223,9 @@ UI = {
         'need_variables': "No hay variables seleccionadas para procesar",
         'need_chunk_size': "El tamaño de bloque debe ser un entero positivo",
         'need_year': "Selecciona al menos un año.",
+        'confirm_unweighted': "No hay ninguna columna de ponderación seleccionada en la pestaña de configuración, "
+                              "así que las tablas contarán cada entrevista como una (sin ponderar)."
+                              "\n\n¿Generarlas igualmente?",
         'wait_scan': "Todavía se están buscando los años del archivo. Vuelve a intentarlo en un momento.",
         'generating': "Generando...",
         'stage_read': "Leyendo el bloque {done}/{total}",
@@ -298,11 +321,6 @@ def output_labels(language):
 # Remembering the choice between sessions
 # ------------------------------------------------------------
 
-def _settings_path():
-    base = os.environ.get('APPDATA') or os.path.join(os.path.expanduser('~'), '.config')
-    return os.path.join(base, 'SurveyTabulator', 'settings.json')
-
-
 def system_language():
     """The language of the operating system, if it is one of the supported ones."""
     try:
@@ -317,19 +335,9 @@ def system_language():
 
 
 def load_language():
-    try:
-        with open(_settings_path(), encoding='utf-8') as f:
-            language = json.load(f).get('language')
-    except (OSError, ValueError, AttributeError):
-        language = None
+    language = settings.load().get('language')
     return language if language in LANGUAGES else system_language()
 
 
 def save_language(language):
-    try:
-        path = _settings_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump({'language': language}, f)
-    except OSError:
-        pass    # the choice still applies to this session
+    settings.update(language=language)

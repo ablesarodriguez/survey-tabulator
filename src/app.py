@@ -15,6 +15,8 @@ from tkinter.constants import *
 
 import pyreadstat
 
+import settings
+
 try:
     import ttkbootstrap as ttk
     from ttkbootstrap.constants import *
@@ -23,11 +25,11 @@ except ImportError:
     from tkinter import ttk
     TTKBOOTSTRAP_OK = False
 
-from config import DEFAULT_CHUNK_SIZE, SPECIAL_CODES, YEAR_COLUMN
+from config import DEFAULT_CHUNK_SIZE, SPECIAL_CODES
 from excel_export import write_excel
 from i18n import LANGUAGES, load_language, save_language, ui_texts
 from pdf_export import write_pdf
-from tabulation import Cancelled, accumulate, scan_years
+from tabulation import Cancelled, accumulate, default_columns, scan_years
 
 
 def bootstyle(name):
@@ -43,8 +45,10 @@ class App:
 
     def __init__(self, root, language=None):
         self.root = root
-        self.root.geometry("1000x860")
-        self.root.minsize(920, 720)
+        # As tall as the settings tab needs, but never taller than the screen
+        height = max(680, min(900, self.root.winfo_screenheight() - 90))
+        self.root.geometry(f"1000x{height}")
+        self.root.minsize(920, 660)
 
         self.language = language or load_language()
         self.texts = ui_texts(self.language)
@@ -54,6 +58,9 @@ class App:
         self.busy = False
         self.scanning = False
         self.all_variables = []
+        # Which columns of the loaded file hold the wave and the weights
+        self.columns = {'year': None, 'weight': None, 'online_weight': None}
+        self.column_boxes = {}
         # What the loaded file declares; the settings tab is drawn from these
         self.years = None            # None: single wave, []: no valid data, [..]: the waves
         self.special_codes = {}
@@ -228,7 +235,7 @@ class App:
 
     def _build_settings_tab(self):
         frame_language = ttk.LabelFrame(self.tab_settings, text=self.tr('language_frame'))
-        frame_language.pack(fill=X, pady=(0, 12), ipadx=8, ipady=4)
+        frame_language.pack(fill=X, pady=(0, 8), ipadx=8, ipady=2)
         radio = bootstyle("primary")
         for column, (code, name) in enumerate(LANGUAGES.items()):
             ttk.Radiobutton(frame_language, text=name, variable=self.language_var, value=code,
@@ -237,7 +244,7 @@ class App:
                   foreground="gray").grid(row=0, column=len(LANGUAGES), sticky='w', padx=(12, 8))
 
         frame_output = ttk.LabelFrame(self.tab_settings, text=self.tr('output_frame'))
-        frame_output.pack(fill=X, pady=(0, 12), ipadx=8, ipady=6)
+        frame_output.pack(fill=X, pady=(0, 8), ipadx=8, ipady=4)
 
         ttk.Label(frame_output, text=self.tr('export_format'), font=('Segoe UI', 9, 'bold')).grid(row=0, column=0, sticky='w', padx=8, pady=6)
         ttk.Radiobutton(frame_output, text="Excel (.xlsx)", variable=self.output_format, value='excel', **radio).grid(row=0, column=1, padx=4)
@@ -253,22 +260,52 @@ class App:
         ttk.Checkbutton(frame_output, text=self.tr('show_stats'),
                         variable=self.show_stats, **toggle).grid(row=3, column=0, columnspan=4, sticky='w', padx=8, pady=(6, 0))
 
+        # The wave and weight columns are picked from the variables of the file
+        frame_columns = ttk.LabelFrame(self.tab_settings, text=self.tr('columns_frame'))
+        frame_columns.pack(fill=X, pady=(0, 8), ipadx=8, ipady=2)
+        self.column_boxes = {}
+        for position, role in enumerate(('year', 'weight', 'online_weight')):
+            ttk.Label(frame_columns, text=self.tr('column_' + role), font=('Segoe UI', 9, 'bold')).grid(
+                row=0, column=2 * position, sticky='w', padx=(8, 4), pady=6)
+            box = ttk.Combobox(frame_columns, state='readonly', width=20)
+            box.grid(row=0, column=2 * position + 1, sticky='w', padx=(0, 12))
+            box.bind('<<ComboboxSelected>>', lambda event, role=role: self._on_column_change(role))
+            self.column_boxes[role] = box
+        self._show_columns()
+
         frame_years = ttk.LabelFrame(self.tab_settings, text=self.tr('year_frame'))
-        frame_years.pack(fill=X, pady=(0, 12), ipadx=8, ipady=6)
-        ttk.Label(frame_years, text=self.tr('year_hint'),
-                  font=('Segoe UI', 9), foreground="gray").pack(anchor="w", padx=8, pady=(6, 4))
+        frame_years.pack(fill=X, pady=(0, 8), ipadx=8, ipady=2)
         self.frame_years_inner = ttk.Frame(frame_years)
-        self.frame_years_inner.pack(fill=X, padx=8)
+        self.frame_years_inner.pack(side=LEFT, padx=8, pady=4)
+        ttk.Label(frame_years, text=self.tr('year_hint'),
+                  font=('Segoe UI', 9), foreground="gray").pack(side=LEFT, padx=(12, 8))
 
         frame_special = ttk.LabelFrame(self.tab_settings, text=self.tr('special_frame'))
         frame_special.pack(fill=BOTH, expand=True, ipadx=8, ipady=6)
         ttk.Label(frame_special, text=self.tr('special_hint'),
-                  font=('Segoe UI', 9), foreground="gray").pack(anchor="w", padx=8, pady=(6, 10))
+                  font=('Segoe UI', 9), foreground="gray").pack(anchor="w", padx=8, pady=(4, 6))
         self.frame_codes_inner = ttk.Frame(frame_special)
         self.frame_codes_inner.pack(fill=BOTH, expand=True, padx=8)
 
         self._show_years()
         self._show_special_codes()
+
+    def _show_columns(self):
+        none = self.tr('column_none')
+        for role, box in self.column_boxes.items():
+            box.config(values=[none] + self.all_variables, state='readonly' if self.meta is not None else 'disabled')
+            box.set(self.columns[role] or none)
+
+    def _on_column_change(self, role):
+        if self.busy:
+            self._show_columns()
+            return
+        chosen = self.column_boxes[role].get()
+        self.columns[role] = chosen if chosen in self.all_variables else None
+        # Remembered, so that files with the same layout open ready to use
+        settings.update(columns=dict(self.columns))
+        if role == 'year':
+            self._refresh_years()
 
     def _on_language_change(self):
         language = self.language_var.get()
@@ -668,9 +705,8 @@ class App:
         self._filter_available()
         self._show_file_info()
 
-        is_longitudinal = YEAR_COLUMN in self.all_variables
-        # The total column only makes sense next to the per-year columns
-        self.show_total.set(is_longitudinal)
+        self.columns = default_columns(self.all_variables, settings.load().get('columns'))
+        self._show_columns()
 
         self.special_codes = {}
         for labels in meta.variable_value_labels.values():
@@ -684,29 +720,38 @@ class App:
         self.special_checkboxes = {value: tk.BooleanVar(value=False) for value in self.special_codes}
         self._show_special_codes()
 
+        self.progress['value'] = 0
+        self.notebook.select(self.tab_variables)
+        self._refresh_years()
+
+    def _refresh_years(self):
+        """Find the waves of the file in the column currently chosen for them."""
+        path, year_column = self.file_path, self.columns['year']
+        is_longitudinal = year_column is not None
+        # The total column only makes sense next to the per-year columns
+        self.show_total.set(is_longitudinal)
+
         self.years = None
         self.year_checkboxes = {0: tk.BooleanVar(value=True)} if not is_longitudinal else {}
         self.scanning = is_longitudinal
         self._show_years()
-        self.progress['value'] = 0
         self._set_status('year_scanning' if is_longitudinal else 'ready')
-        self.notebook.select(self.tab_variables)
 
         if is_longitudinal:
             # Finding the waves means a pass over the whole file: done in the
             # background so that the window stays usable meanwhile.
             def scan():
                 try:
-                    years = scan_years(path)
+                    years = scan_years(path, year_column)
                 except Exception:
                     years = []
-                self._post(self._years_scanned, path, years)
+                self._post(self._years_scanned, path, year_column, years)
 
             threading.Thread(target=scan, daemon=True).start()
 
-    def _years_scanned(self, path, years):
-        if path != self.file_path:
-            return      # another file was opened in the meantime
+    def _years_scanned(self, path, year_column, years):
+        if path != self.file_path or year_column != self.columns['year']:
+            return      # another file or another column was chosen in the meantime
         self.scanning = False
         self.years = years
         self.year_checkboxes = {year: tk.BooleanVar(value=True) for year in years}
@@ -727,9 +772,9 @@ class App:
         elif self.scanning:
             note('year_scanning')
         elif self.years is None:
-            note('year_single', column=YEAR_COLUMN)
+            note('year_single')
         elif not self.years:
-            note('year_empty', column=YEAR_COLUMN)
+            note('year_empty', column=self.columns['year'])
         else:
             for year in self.years:
                 ttk.Checkbutton(self.frame_years_inner, text=str(year), variable=self.year_checkboxes[year],
@@ -788,6 +833,12 @@ class App:
             messagebox.showwarning(self.tr('warning'), self.tr('need_year'))
             return
 
+        # Unweighted tables are a legitimate choice, but never a silent one
+        if self.columns['weight'] is None and not messagebox.askyesno(
+                self.tr('warning'), self.tr('confirm_unweighted')):
+            self.notebook.select(self.tab_settings)
+            return
+
         output_format = self.output_format.get()
         if output_format == 'pdf':
             filetypes, extension = [(self.tr('type_pdf'), "*.pdf")], ".pdf"
@@ -821,7 +872,7 @@ class App:
         show_stats = self.show_stats.get()
         output_format = self.output_format.get()
         language = self.language
-        path, meta = self.file_path, self.meta
+        path, meta, columns = self.file_path, self.meta, dict(self.columns)
 
         base, _ext = os.path.splitext(output_path)
         excel_path = base + ".xlsx"
@@ -843,7 +894,7 @@ class App:
                     self._post(self._update_progress, stage, done, total, detail)
 
                 data = accumulate(path, meta, variables, excluded_codes, selected_years,
-                                  chunk_size=chunk_size, on_progress=on_progress)
+                                  chunk_size=chunk_size, on_progress=on_progress, columns=columns)
 
                 written = []
                 if output_format in ('excel', 'both'):
