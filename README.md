@@ -1,5 +1,7 @@
 # Survey Tabulator
 
+[![CI](https://github.com/ablesarodriguez/survey-tabulator/actions/workflows/ci.yml/badge.svg)](https://github.com/ablesarodriguez/survey-tabulator/actions/workflows/ci.yml)
+
 A desktop application that turns **any** SPSS `.sav` survey file into weighted frequency tables, in
 Excel and PDF, without ever loading the file into memory.
 
